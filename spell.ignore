@@ -95,6 +95,7 @@ capabilities
 cartesian
 ccw
 CCW
+CEC
 cd
 cdrom
 cellno
@@ -1259,3 +1260,5 @@ Meina
 meili
 ntp
 userfaultfd
+datastore
+https

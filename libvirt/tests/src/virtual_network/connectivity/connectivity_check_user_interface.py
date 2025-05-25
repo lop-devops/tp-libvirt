@@ -65,7 +65,7 @@ def run(test, params, env):
         vm = libvirt_unprivileged.get_unprivileged_vm(vm_name, test_user,
                                                       test_passwd,
                                                       **unpr_vm_args)
-        virsh_ins = virsh.VirshPersistent(uri=virsh_uri)
+        virsh_ins = virsh.Virsh(uri=virsh_uri)
         host_session = aexpect.ShellSession('su')
         remote.VMManager.set_ssh_auth(host_session, 'localhost', test_user,
                                       test_passwd)
@@ -79,7 +79,7 @@ def run(test, params, env):
     host_iface = params.get('host_iface')
     backend = params.get('backend')
     host_iface = host_iface if host_iface else utils_net.get_default_gateway(
-        iface_name=True, force_dhcp=True, json=True).split()[0]
+        iface_name=True, force_dhcp=True, json=True)
 
     ipv4_addr = params.get('ipv4_addr')
     ipv4_prefix = params.get('ipv4_prefix')
@@ -144,5 +144,3 @@ def run(test, params, env):
         vm.destroy()
     finally:
         bkxml.sync(virsh_instance=virsh_ins)
-        if not root:
-            del virsh_ins

@@ -18,7 +18,6 @@ from virttest.utils_conn import update_crypto_policy
 from virttest.utils_test import libvirt
 from virttest.utils_v2v import params_get
 from avocado.utils import process
-from avocado.utils import download
 from aexpect.exceptions import ShellProcessTerminatedError, ShellTimeoutError, ShellStatusError
 
 from provider.v2v_vmcheck_helper import VMChecker
@@ -308,7 +307,10 @@ def run(test, params, env):
             Get qemu-guest-agent service info
             """
             status_ptn = r'Active: active \((running|exited)\)|qemu-ga \(pid +[0-9]+\) is running'
-            cmd = 'service qemu-ga status;systemctl status qemu-guest-agent;systemctl status qemu-ga*'
+            if os_version == 'sles':
+                cmd = 'systemctl status qemu-guest-agent'
+            else:
+                cmd = 'service qemu-ga status;systemctl status qemu-guest-agent;systemctl status qemu-ga*'
             _, output = vmcheck.run_cmd(cmd)
             if not re.search(status_ptn, output):
                 return False
@@ -430,12 +432,14 @@ def run(test, params, env):
                 # IP address
                 if i == 0:
                     ip_addr = r'IPv4 Address.*?: %s' % value
+                    LOG.info('static ip addr: %s', re.search(ip_addr, ipconfig, re.S))
                     if not re.search(ip_addr, ipconfig, re.S):
                         LOG.debug('Found IP addr failed')
                         return False
                 # Default gateway
                 if i == 1:
                     ip_gw = r'Default Gateway.*?: .*?%s' % value
+                    LOG.info('static gateway: %s', re.search(ip_gw, ipconfig, re.S))
                     if not re.search(ip_gw, ipconfig, re.S):
                         LOG.debug('Found Gateway failed')
                         return False
@@ -446,12 +450,14 @@ def run(test, params, env):
                     cidr = '.'.join(
                         [str(int(bin_mask[i * 8:i * 8 + 8], 2)) for i in range(4)])
                     sub_mask = r'Subnet Mask.*?: %s' % cidr
+                    LOG.info('static subnet mask: %s', re.search(sub_mask, ipconfig, re.S))
                     if not re.search(sub_mask, ipconfig, re.S):
                         LOG.debug('Found subnet mask failed')
                         return False
                 # DNS server list
                 if i >= 3:
                     dns_server = r'DNS Servers.*?:.*?%s' % value
+                    LOG.info('static DNS: %s', re.search(dns_server, ipconfig, re.S))
                     if not re.search(dns_server, ipconfig, re.S):
                         LOG.debug('Found DNS Server failed')
                         return False
@@ -803,24 +809,6 @@ def run(test, params, env):
             ovirt4_path = os.path.dirname(ovirtsdk4.__file__)
             dst_ovirt4_path = ovirt4_path + '.bak'
             os.rename(ovirt4_path, dst_ovirt4_path)
-        if checkpoint[0].startswith('ogac') and 'ogac_balloon' not in checkpoint:
-            os.environ['VIRTIO_WIN'] = virtio_win_path
-            if os_type == 'linux' and not utils_v2v.multiple_versions_compare(implementation_change_ver) and \
-                    os.path.isdir(os.getenv('VIRTIO_WIN')):
-                export_path = os.getenv('VIRTIO_WIN')
-                qemu_guest_agent_dir = os.path.join(export_path, qa_path)
-                if not os.path.exists(qemu_guest_agent_dir) and os.access(
-                        export_path, os.W_OK) and qa_url:
-                    LOG.debug(
-                        'Not found qemu-guest-agent in virtio-win or rhv-guest-tools-iso,'
-                        ' Try to prepare it manually. This is not a permanent step, once'
-                        ' the official build includes it, this step should be removed.')
-                    os.makedirs(qemu_guest_agent_dir)
-                    rpm_name = os.path.basename(qa_url)
-                    download.get_file(
-                        qa_url, os.path.join(
-                            qemu_guest_agent_dir, rpm_name))
-
         if 'vddk_error' in checkpoint:
             fqdn_record = params_get(params, 'fqdn_record')
             with open('/etc/hosts', 'r+') as fd:

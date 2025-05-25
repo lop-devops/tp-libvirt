@@ -26,7 +26,7 @@ def run(test, params, env):
     outside_ip = params.get("outside_ip")
     host_iface = params.get("host_iface")
     host_iface = host_iface if host_iface else utils_net.get_default_gateway(
-        iface_name=True, force_dhcp=True).split()[0]
+        iface_name=True, force_dhcp=True, json=True)
     rand_id = utils_misc.generate_random_string(3)
     bridge_name = "br_" + rand_id
     tap_name = "tap_" + rand_id
@@ -50,7 +50,7 @@ def run(test, params, env):
         vm_name = params.get("unpr_vm_name")
         vm = libvirt_unprivileged.get_unprivileged_vm(
             vm_name, test_user, test_passwd, **unpr_vm_args)
-        virsh_ins = virsh.VirshPersistent(uri=vm.connect_uri)
+        virsh_ins = virsh.Virsh(uri=vm.connect_uri)
 
     vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(
         vm_name, virsh_instance=virsh_ins)
@@ -110,7 +110,7 @@ def run(test, params, env):
         session.close()
 
     finally:
-        bkxml.sync()
+        bkxml.sync(virsh_instance=virsh_ins)
         if interface_type == "ethernet":
             network_base.delete_tap(tap_name)
             utils_net.delete_linux_bridge_tmux(bridge_name, host_iface)

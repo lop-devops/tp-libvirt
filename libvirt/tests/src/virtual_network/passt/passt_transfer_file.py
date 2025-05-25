@@ -48,7 +48,7 @@ def transfer_host_to_vm(session, prot, ip_ver, params, test):
     cmd_transfer = eval(params.get('cmd_transfer'))
     process.run(cmd_transfer, shell=True)
 
-    if session.cmd_status(f'test -a {rec_file}') != 0:
+    if session.cmd_status(f'test -e {rec_file}') != 0:
         test.fail(f'VM did not recieve {rec_file}')
     vm_file_md5 = session.cmd_output(f'md5sum {rec_file}')
     vm_file_md5 = vm_file_md5.split()[0]
@@ -143,7 +143,7 @@ def run(test, params, env):
                                                       test_passwd,
                                                       **unpr_vm_args)
         uri = f'qemu+ssh://{test_user}@localhost/session'
-        virsh_ins = virsh.VirshPersistent(uri=uri)
+        virsh_ins = virsh.Virsh(uri=uri)
         host_session = aexpect.ShellSession('su')
         remote.VMManager.set_ssh_auth(host_session, 'localhost', test_user,
                                       test_passwd)
@@ -154,7 +154,7 @@ def run(test, params, env):
     params['proc_checks'] = proc_checks = eval(params.get('proc_checks', '{}'))
     host_iface = params.get('host_iface')
     host_iface = host_iface if host_iface else utils_net.get_default_gateway(
-        iface_name=True, force_dhcp=True).split()[0]
+        iface_name=True, force_dhcp=True, json=True)
     log_file = f'/run/user/{user_id}/passt.log'
     iface_attrs['backend']['logFile'] = log_file
     iface_attrs['source']['dev'] = host_iface
@@ -193,6 +193,4 @@ def run(test, params, env):
         bkxml.sync(virsh_instance=virsh_ins)
         if root:
             shutil.rmtree(log_dir)
-        else:
-            del virsh_ins
         utils_selinux.set_status(selinux_status)

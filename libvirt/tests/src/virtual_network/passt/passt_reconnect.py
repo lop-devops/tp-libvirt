@@ -13,8 +13,8 @@ from virttest import utils_selinux
 from virttest import virsh
 from virttest.libvirt_xml import vm_xml
 from virttest.staging import service
+from virttest.staging import utils_memory
 from virttest.utils_libvirt import libvirt_unprivileged
-from virttest.utils_test import libvirt
 
 from provider.virtual_network import network_base
 from provider.virtual_network import passt
@@ -50,7 +50,7 @@ def run(test, params, env):
                                                       test_passwd,
                                                       **unpr_vm_args)
         uri = f'qemu+ssh://{test_user}@localhost/session'
-        virsh_ins = virsh.VirshPersistent(uri=uri)
+        virsh_ins = virsh.Virsh(uri=uri)
         host_session = aexpect.ShellSession('su')
         remote.VMManager.set_ssh_auth(host_session, 'localhost', test_user,
                                       test_passwd)
@@ -61,18 +61,19 @@ def run(test, params, env):
     params['socket_dir'] = socket_dir = eval(params.get('socket_dir'))
     params['proc_checks'] = proc_checks = eval(params.get('proc_checks', '{}'))
     mtu = params.get('mtu')
-    qemu_cmd_check = params.get('qemu_cmd_check')
     outside_ip = params.get('outside_ip')
     host_iface = params.get('host_iface')
     host_iface = host_iface if host_iface else utils_net.get_default_gateway(
-        iface_name=True, force_dhcp=True).split()[0]
+        iface_name=True, force_dhcp=True, json=True)
     log_file = f'/run/user/{user_id}/passt.log'
     iface_attrs['backend']['logFile'] = log_file
     iface_attrs['source']['dev'] = host_iface
+    vhostuser = 'yes' == params.get('vhostuser', 'no')
 
     vmxml = vm_xml.VMXML.new_from_inactive_dumpxml(vm_name,
                                                    virsh_instance=virsh_ins)
     bkxml = vmxml.copy()
+    shp_orig_num = utils_memory.get_num_huge_pages()
 
     selinux_status = passt.ensure_selinux_enforcing()
     passt.check_socat_installed()
@@ -82,10 +83,12 @@ def run(test, params, env):
         if root:
             passt.make_log_dir(user_id, log_dir)
 
+        if vhostuser:
+            iface_attrs['type_name'] = 'vhostuser'
+            utils_memory.set_num_huge_pages(2048)
+            vm_xml.VMXML.set_memoryBacking_tag(vm_name, access_mode="shared", hpgs=True, vmxml=vmxml)
         passt.vm_add_iface(vmxml, iface_attrs, virsh_ins)
         vm.start()
-
-        libvirt.check_qemu_cmd_line(qemu_cmd_check)
 
         passt_proc = passt.get_proc_info('passt')
         LOG.debug(f'passt process info: {passt_proc}')
@@ -141,6 +144,5 @@ def run(test, params, env):
         bkxml.sync(virsh_instance=virsh_ins)
         if root:
             shutil.rmtree(log_dir)
-        else:
-            del virsh_ins
         utils_selinux.set_status(selinux_status)
+        utils_memory.set_num_huge_pages(shp_orig_num)

@@ -159,22 +159,16 @@ def check_iothreadinfo(vm_name, cpu_range, config=''):
     :param cpu_range: range of CPUs available as a string
     :param config: config parameter as a string, empty by default
     """
-    numa_info = utils_misc.NumaInfo()
     result = virsh.iothreadinfo(vm_name, options=config, debug=True,
                                 ignore_status=False)
-    range_found = False
-    for node in numa_info.get_online_nodes_withcpu():
-        if re.search('{}\s*{}'.format(node, cpu_range),
-                     result.stdout_text):
-            logging.debug(
-                'Expected cpu range: {} found in stdout for '
-                'node: {}.'.format(cpu_range, node))
-            range_found = True
-        else:
-            logging.debug('Node {} has no cpu range'.format(node))
-    if not range_found:
-        raise TestFail('Expected cpu range: {} not found in stdout of '
-                       'iothreadinfo command.'.format(cpu_range))
+    live_vmxml = libvirt_xml.VMXML.new_from_dumpxml(vm_name)
+    iothread_num = live_vmxml.iothreads
+    for iothread_id in range(1, iothread_num + 1):
+        if not re.search('{}\s*{}'.format(iothread_id, cpu_range),
+                         result.stdout_text):
+            raise TestFail(
+                'Iothread {} has no expected cpu affinity {} according to stdout of '
+                'iothreadinfo cmd {}.'.format(iothread_id, cpu_range, result.stdout_text))
 
 
 def check_cgget_output(test, vm, expected_value):

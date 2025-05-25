@@ -112,7 +112,7 @@ def run(test, params, env):
                     exp_val = report_num_q35_7_8
                     if key == "pc-q35-rhel7.3.0":
                         exp_val = report_num_q35_73
-                    elif key == "pc-q35-rhel9.6.0" or key == 'q35':
+                    elif key == "pc-q35-rhel9.6.0" or key == "pc-q35-rhel10.0.0" or key == 'q35':
                         exp_val = report_num_q35_9_6
                     else:
                         if libvirt_version.version_compare(7, 0, 0):
@@ -166,7 +166,8 @@ def run(test, params, env):
             vmxml.vcpu = int(guest_vcpu)
             set_iommu(vmxml)
             result_need_check = virsh.define(vmxml.xml, debug=True)
-
+            if libvirt_version.version_compare(10, 10, 0):
+                err_msg = ""
         # Add ioapic and iommu device in xml for q35 VM
         if check.startswith('ioapic_iommu'):
             logging.info('Modify features')

@@ -41,7 +41,7 @@ def run(test, params, env):
                                                       test_passwd,
                                                       **unpr_vm_args)
         uri = f'qemu+ssh://{test_user}@localhost/session'
-        virsh_ins = virsh.VirshPersistent(uri=uri)
+        virsh_ins = virsh.Virsh(uri=uri)
         host_session = aexpect.ShellSession('su')
         remote.VMManager.set_ssh_auth(host_session, 'localhost', test_user,
                                       test_passwd)
@@ -61,7 +61,7 @@ def run(test, params, env):
     outside_ip = params.get('outside_ip')
     host_iface = params.get('host_iface')
     host_iface = host_iface if host_iface else utils_net.get_default_gateway(
-        iface_name=True, force_dhcp=True, json=True).split()[0]
+        iface_name=True, force_dhcp=True, json=True)
     host_ip = utils_net.get_ip_address_by_interface(host_iface, ip_ver='ipv4')
     status_error = 'yes' == params.get('status_error', 'no')
     err_msg = params.get('err_msg')
@@ -200,5 +200,3 @@ def run(test, params, env):
             if tap_type == 'tap':
                 utils_net.delete_linux_bridge_tmux(bridge_name, host_iface)
         bkxml.sync(virsh_instance=virsh_ins)
-        if not root:
-            virsh_ins.close_session()
