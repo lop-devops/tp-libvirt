@@ -12,6 +12,7 @@ from virttest import virt_vm
 from virttest import virsh
 from virttest import utils_net
 from virttest import utils_package
+from virttest import utils_misc
 from virttest import libvirt_version
 from virttest.staging import service
 from virttest.utils_test import libvirt
@@ -108,6 +109,15 @@ def run(test, params, env):
     iface_virtualport = params.get("iface_virtualport")
     live_add_qos = "yes" == params.get("live_add_qos", 'no')
     check_point = params.get("check_point", "")
+    test_attach_detach = "yes" == params.get("test_attach_detach", "no")
+    verify_guest_iface = "yes" == params.get("verify_guest_iface", "no")
+    test_ping = "yes" == params.get("test_ping", "no")
+    ping_dest = params.get("ping_dest", "")
+    attach_detach_iterations = int(params.get("attach_detach_iterations", "1"))
+    bridge_ip = params.get("bridge_ip", "")
+    bridge_netmask = params.get("bridge_netmask", "")
+    guest_ip = params.get("guest_ip", "")
+    guest_netmask = params.get("guest_netmask", "")
 
     libvirt_version.is_libvirt_feature_supported(params)
     # Destroy the guest first
@@ -148,11 +158,14 @@ def run(test, params, env):
             if live_add_qos:
                 iface_dict.pop('inbound')
                 iface_dict.pop('outbound')
+            
+            # Create iface_attach_xml for both hotplug and test_attach_detach scenarios
+            iface_attach_xml = os.path.join(data_dir.get_data_dir(), "iface_attach.xml")
+            shutil.copyfile(libvirt.modify_vm_iface(vm_name, 'get_xml', iface_dict), iface_attach_xml)
+            
             if not hotplug:
                 libvirt.modify_vm_iface(vm_name, 'update_iface', iface_dict)
             else:
-                iface_attach_xml = os.path.join(data_dir.get_data_dir(), "iface_attach.xml")
-                shutil.copyfile(libvirt.modify_vm_iface(vm_name, 'get_xml', iface_dict), iface_attach_xml)
                 libvirt_vmxml.remove_vm_devices_by_type(vm, 'interface')
 
         try:
@@ -169,14 +182,111 @@ def run(test, params, env):
                 else:
                     virsh.attach_device(vm_name, iface_attach_xml, debug=True,
                                         ignore_status=False)
-                    iface_xml = vm_xml.VMXML.new_from_dumpxml(vm.name).devices.by_device_tag("interface")[0]
                     source_bridge = libvirt.get_interface_details(vm_name)[0]['source']
                     if source_bridge != source["bridge"]:
                         test.fail("Attach-device failed, the source bridge shoule be: %s, and now is: %s"
                                   % (source["bridge"], source_bridge))
+            
+            # Get iface_xml for both hotplug and test_attach_detach scenarios
+            iface_xml = vm_xml.VMXML.new_from_dumpxml(vm.name).devices.by_device_tag("interface")[0]
             iface_name = libvirt.get_ifname_host(vm_name, iface_mac)
             if test_ovs_port:
                 check_ovs_port(iface_name, bridge_name)
+            # OVS attach-detach verification with stress testing support
+            if test_attach_detach:
+                logging.info("OVS attach-detach test (iterations: %d)", attach_detach_iterations)
+                
+                # Configure bridge IP if provided
+                if bridge_ip and bridge_netmask:
+                    logging.info("Configuring bridge %s with IP %s/%s", bridge_name, bridge_ip, bridge_netmask)
+                    # Bring bridge UP
+                    process.run("ip link set %s up" % bridge_name, shell=True)
+                    # Assign IP to bridge
+                    process.run("ip addr add %s/%s dev %s" % (bridge_ip, bridge_netmask, bridge_name), shell=True)
+                    logging.info("✓ Bridge configured and UP")
+                
+                for iteration in range(attach_detach_iterations):
+                    if iteration > 0:
+                        logging.info("=== Iteration %d/%d ===", iteration + 1, attach_detach_iterations)
+                        # Re-attach using the same method as initial attach
+                        if attach_type == "interface":
+                            options = "--type %s --source %s --model %s" % (iface_type, source["bridge"], iface_model)
+                            virsh.attach_interface(vm_name, options, ignore_status=False, debug=True)
+                        else:
+                            virsh.attach_device(vm_name, iface_attach_xml, debug=True, ignore_status=False)
+                        # Update iface_xml after re-attach
+                        iface_xml = vm_xml.VMXML.new_from_dumpxml(vm.name).devices.by_device_tag("interface")[0]
+                    
+                    # Verify attach: Check VM XML and OVS bridge connection
+                    vmxml = vm_xml.VMXML.new_from_dumpxml(vm_name)
+                    if not any(i.mac_address == iface_mac for i in vmxml.get_devices('interface')):
+                        test.fail("Interface not in VM XML after attach")
+                    
+                    tap_name = utils_misc.wait_for(
+                        lambda: libvirt.get_ifname_host(vm_name, iface_mac), timeout=10)
+                    if not tap_name:
+                        test.fail("Failed to get tap device")
+                    
+                    _, ovs_br = utils_net.find_current_bridge(tap_name)
+                    if ovs_br != bridge_name:
+                        test.fail("Tap '%s' on wrong bridge: %s (expected %s)"
+                                 % (tap_name, ovs_br, bridge_name))
+                    logging.info("✓ Attached: tap=%s, bridge=%s", tap_name, ovs_br)
+                    
+                    # Verify in guest if requested
+                    if verify_guest_iface:
+                        # Use serial console instead of SSH (no network dependency)
+                        session = vm.wait_for_serial_login()
+                        try:
+                            guest_iface = utils_net.get_linux_ifname(session, iface_mac)
+                            if not guest_iface:
+                                test.fail("Interface not found in guest")
+                            
+                            # Bring interface UP
+                            status, output = session.cmd_status_output("ip link show %s" % guest_iface)
+                            if status == 0 and "UP" not in output:
+                                session.cmd("ip link set %s up" % guest_iface)
+                            logging.info("✓ Guest interface: %s", guest_iface)
+                            
+                            # Configure guest IP if provided
+                            if guest_ip and guest_netmask:
+                                logging.info("Configuring guest interface with IP %s/%s", guest_ip, guest_netmask)
+                                session.cmd("ip addr add %s/%s dev %s" % (guest_ip, guest_netmask, guest_iface))
+                                logging.info("✓ Guest IP configured")
+                            
+                            if test_ping and ping_dest:
+                                status, output = session.cmd_status_output("ping -c 3 -W 5 %s" % ping_dest, timeout=20)
+                                if status != 0:
+                                    test.fail("Ping to %s failed (status=%d): %s" % (ping_dest, status, output))
+                                logging.info("✓ Ping %s: OK", ping_dest)
+                        finally:
+                            session.close()
+                    
+                    # Detach and verify cleanup after each iteration
+                    if detach:
+                        if detach_type == "interface":
+                            virsh.detach_interface(vm_name, "--type %s --mac %s" % (iface_type, iface_mac),
+                                                 ignore_status=False, debug=True)
+                        else:
+                            virsh.detach_device(vm_name, iface_xml.xml, ignore_status=False, debug=True)
+                        
+                        # Verify detach: Check VM XML and OVS bridge
+                        if not utils_misc.wait_for(
+                            lambda: not any(i.mac_address == iface_mac
+                                          for i in vm_xml.VMXML.new_from_dumpxml(vm_name).get_devices('interface')),
+                            timeout=10):
+                            test.fail("Interface still in VM XML after detach")
+                        
+                        if not utils_misc.wait_for(
+                            lambda: not utils_net.find_current_bridge(tap_name)[1] if tap_name else True,
+                            timeout=10, ignore_errors=True):
+                            logging.warning("Tap device may still be connected")
+                        
+                        logging.info("✓ Detached successfully")
+                
+                logging.info("OVS attach-detach test completed (%d iterations)", attach_detach_iterations)
+            
+            
             if live_add_qos:
                 inbound_opt = ",".join(re.findall(r'[0-9]+', iface_inbound))
                 outbount_opt = ",".join(re.findall(r'[0-9]+', iface_outbound))
@@ -192,7 +302,9 @@ def run(test, params, env):
                 res2 = utils_net.check_filter_rules(tap_name, ast.literal_eval(iface_outbound))
                 if not res1 or not res2:
                     test.fail("Qos test fail!")
-            if detach:
+            # Only run original detach logic if not using test_attach_detach
+            # (test_attach_detach handles detach in its own loop)
+            if detach and not test_attach_detach:
                 if detach_type == "interface":
                     options = "--type %s --mac %s" % (iface_type, iface_mac)
                     virsh.detach_interface(vm_name, options,
