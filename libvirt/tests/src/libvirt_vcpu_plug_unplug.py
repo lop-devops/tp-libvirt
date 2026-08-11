@@ -4,6 +4,7 @@ import logging as log
 import time
 
 from avocado.utils import cpu as cpu_util
+from virttest.libvirt_xml.vm_xml import VMCPUXML
 
 from virttest import virsh
 from virttest import data_dir
@@ -240,6 +241,10 @@ def run(test, params, env):
     with_stress = "yes" == params.get("run_stress", "no")
     iterations = int(params.get("test_itr", 1))
     topology_correction = "yes" == params.get("topology_correction", "no")
+    topology_diff = "yes" == params.get("topology_required", "no")
+    topology_threads = params.get("topology_threads")
+    topology_cores = params.get("topology_cores")
+    topology_sockets = params.get("topology_sockets")
     # Init expect vcpu count values
     expect_vcpu_num = {'max_config': vcpu_max_num, 'max_live': vcpu_max_num,
                        'cur_config': vcpu_current_num,
@@ -300,8 +305,78 @@ def run(test, params, env):
             vmxml.remove_agent_channels()
         vmxml.sync()
 
-        vmxml.set_vm_vcpus(vm_name, vcpu_max_num, vcpu_current_num,
-                           topology_correction=topology_correction)
+        if topology_diff:
+            # Set explicit CPU topology (sockets/cores/threads) then
+            # redistribute any existing NUMA cells to match the new vcpu count.
+            vmxml.vcpu = vcpu_max_num
+            vmxml.current_vcpu = vcpu_current_num
+
+            try:
+                cpu_xml = vmxml.cpu
+            except Exception:
+                cpu_xml = VMCPUXML()
+
+            topology = {}
+            if topology_sockets:
+                topology['sockets'] = int(topology_sockets)
+            if topology_cores:
+                topology['cores'] = int(topology_cores)
+            if topology_threads:
+                topology['threads'] = int(topology_threads)
+            if topology:
+                cpu_xml.topology = topology
+                vmxml.cpu = cpu_xml
+                logging.info("CPU topology set: %s", topology)
+
+            vmxml.sync()
+
+            # Redistribute NUMA cells to match the new vcpu count
+            numa_enabled = params.get("numa") == "yes"
+            if numa_enabled:
+                logging.info("Fixing NUMA cells to match topology")
+                vmxml = VMXML.new_from_inactive_dumpxml(vm_name)
+                try:
+                    cpu_xml = vmxml.cpu
+                    if hasattr(cpu_xml, 'numa_cell') and cpu_xml.numa_cell:
+                        num_cells = len(cpu_xml.numa_cell)
+                        cpus_per_cell = vcpu_max_num // num_cells
+                        remaining = vcpu_max_num % num_cells
+                        # Divide total guest memory equally — do NOT copy the
+                        # stale per-cell value which would multiply total RAM
+                        # by num_cells.
+                        total_mem_mib = int(params.get("mem", "16384"))
+                        cell_memory_kib = (total_mem_mib * 1024) // num_cells
+
+                        new_cells = []
+                        cpu_start = 0
+                        for i in range(num_cells):
+                            cell_cpus = cpus_per_cell + (1 if i < remaining else 0)
+                            cpu_end = cpu_start + cell_cpus - 1
+                            cell_dict = {
+                                'id': str(i),
+                                'cpus': ("%d-%d" % (cpu_start, cpu_end)
+                                         if cell_cpus > 1 else str(cpu_start)),
+                                'memory': str(cell_memory_kib),
+                                'unit': 'KiB',
+                            }
+                            new_cells.append(cell_dict)
+                            logging.info("NUMA cell %d: CPUs %s, Memory %d KiB",
+                                         i, cell_dict['cpus'], cell_memory_kib)
+                            cpu_start = cpu_end + 1
+
+                        cpu_xml.numa_cell = cpu_xml.dicts_to_cells(new_cells)
+                        vmxml.cpu = cpu_xml
+                        vmxml.sync()
+                        logging.info("NUMA cells redistributed successfully")
+                    else:
+                        test.fail("NUMA enabled but no NUMA cells found "
+                                  "after topology sync")
+                except Exception as e:
+                    test.fail("Failed to redistribute NUMA cells: %s" % str(e))
+        else:
+            vmxml.set_vm_vcpus(vm_name, vcpu_max_num, vcpu_current_num,
+                               topology_correction=topology_correction)
+
         vm.start()
         vm_uptime_init = vm.uptime()
         if with_stress:
