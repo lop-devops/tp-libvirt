@@ -4,6 +4,7 @@ import logging as log
 import time
 
 from avocado.utils import cpu as cpu_util
+from virttest.libvirt_xml.vm_xml import VMCPUXML
 
 from virttest import virsh
 from virttest import data_dir
@@ -240,6 +241,7 @@ def run(test, params, env):
     with_stress = "yes" == params.get("run_stress", "no")
     iterations = int(params.get("test_itr", 1))
     topology_correction = "yes" == params.get("topology_correction", "no")
+    numa_cells_param = params.get("numa_cells")
     # Init expect vcpu count values
     expect_vcpu_num = {'max_config': vcpu_max_num, 'max_live': vcpu_max_num,
                        'cur_config': vcpu_current_num,
@@ -300,8 +302,69 @@ def run(test, params, env):
             vmxml.remove_agent_channels()
         vmxml.sync()
 
-        vmxml.set_vm_vcpus(vm_name, vcpu_max_num, vcpu_current_num,
-                           topology_correction=topology_correction)
+        if numa_cells_param:
+            # Configure multiple NUMA cells with evenly distributed CPUs/memory.
+            # Each cell gets (vcpu_max_num // numa_cells) CPUs and an equal
+            # share of the total guest memory (mem param, in MiB).
+            numa_cells = int(numa_cells_param)
+            logging.info("Configuring %d NUMA cells for multi-NUMA test",
+                         numa_cells)
+
+            vmxml.vcpu = vcpu_max_num
+            vmxml.current_vcpu = vcpu_current_num
+
+            try:
+                cpu_xml = vmxml.cpu
+            except Exception:
+                cpu_xml = VMCPUXML()
+
+            # Ensure topology matches vcpu_max_num (sockets=1, cores=max, threads=1)
+            existing_topology = getattr(cpu_xml, 'topology', None)
+            topo_ok = False
+            if existing_topology:
+                topo_total = (int(existing_topology.get('sockets', 1)) *
+                              int(existing_topology.get('cores', 1)) *
+                              int(existing_topology.get('threads', 1)))
+                topo_ok = (topo_total == vcpu_max_num)
+            if not topo_ok:
+                cpu_xml.topology = {'sockets': 1,
+                                    'cores': vcpu_max_num,
+                                    'threads': 1}
+                logging.info("Set topology: sockets=1, cores=%d, threads=1",
+                             vcpu_max_num)
+
+            # Build NUMA cell list — CPUs and memory split equally
+            cpus_per_cell = vcpu_max_num // numa_cells
+            remaining = vcpu_max_num % numa_cells
+            total_mem_mib = int(params.get("mem", "16384"))
+            cell_memory_kib = (total_mem_mib * 1024) // numa_cells
+
+            numa_cell_list = []
+            cpu_start = 0
+            for i in range(numa_cells):
+                cell_cpus = cpus_per_cell + (1 if i < remaining else 0)
+                cpu_end = cpu_start + cell_cpus - 1
+                cell_dict = {
+                    'id': str(i),
+                    'cpus': ("%d-%d" % (cpu_start, cpu_end)
+                             if cell_cpus > 1 else str(cpu_start)),
+                    'memory': str(cell_memory_kib),
+                    'unit': 'KiB',
+                }
+                numa_cell_list.append(cell_dict)
+                logging.info("NUMA cell %d: CPUs %s, Memory %d KiB",
+                             i, cell_dict['cpus'], cell_memory_kib)
+                cpu_start = cpu_end + 1
+
+            cpu_xml.numa_cell = cpu_xml.dicts_to_cells(numa_cell_list)
+            vmxml.cpu = cpu_xml
+            vmxml.sync()
+            logging.info("Multi-NUMA configuration applied: %d cells",
+                         numa_cells)
+        else:
+            vmxml.set_vm_vcpus(vm_name, vcpu_max_num, vcpu_current_num,
+                               topology_correction=topology_correction)
+
         vm.start()
         vm_uptime_init = vm.uptime()
         if with_stress:
