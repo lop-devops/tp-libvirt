@@ -12,6 +12,7 @@ from virttest import cpu
 from virttest import utils_libvirtd
 from virttest import utils_test
 from virttest.utils_test import libvirt
+from virttest import utils_kdump
 from virttest.libvirt_xml.vm_xml import VMXML
 
 from provider.cpu import patch_total_cpu_count_s390x
@@ -240,6 +241,8 @@ def run(test, params, env):
     with_stress = "yes" == params.get("run_stress", "no")
     iterations = int(params.get("test_itr", 1))
     topology_correction = "yes" == params.get("topology_correction", "no")
+    kdump_after_plug_unplug = "yes" == params.get("kdump_after_plug_unplug", "no")
+    crash_dir = params.get("crash_dir", "/var/crash/")
     # Init expect vcpu count values
     expect_vcpu_num = {'max_config': vcpu_max_num, 'max_live': vcpu_max_num,
                        'cur_config': vcpu_current_num,
@@ -355,6 +358,21 @@ def run(test, params, env):
                         if not utils_misc.wait_for(lambda: cpu.check_if_vm_vcpu_match(vcpu_plug_num, vm),
                                                    vcpu_max_timeout, text="wait for vcpu online") or not online_new_vcpu(vm, vcpu_plug_num):
                             test.fail("Fail to enable new added cpu")
+
+                        # Trigger kdump after hotplug to verify guest kernel
+                        # stability under the new vCPU count
+                        if kdump_after_plug_unplug:
+                            logging.info("Triggering kdump after vCPU hotplug")
+                            kdump_session = vm.wait_for_login(timeout=240)
+                            utils_kdump.trigger_crash(vm, session=kdump_session,
+                                                      wait_time=120, test=test)
+                            logging.info("Verifying vmcore generated after hotplug kdump")
+                            pre_vmcores = utils_kdump.get_vmcores(
+                                vm, crash_dir=crash_dir, test=test)
+                            if not pre_vmcores:
+                                test.fail("No vmcore generated after hotplug kdump")
+                            logging.info("vmcore confirmed after hotplug: %s",
+                                         pre_vmcores)
 
                 # Pin vcpu
                 if pin_after_plug:
@@ -479,6 +497,21 @@ def run(test, params, env):
                     if session:
                         session.close()
 
+                # Trigger kdump after unplug to verify guest kernel
+                # stability under the reduced vCPU count
+                if kdump_after_plug_unplug:
+                    logging.info("Triggering kdump after vCPU unplug")
+                    kdump_session = vm.wait_for_login(timeout=240)
+                    utils_kdump.trigger_crash(vm, session=kdump_session,
+                                              wait_time=120, test=test)
+                    logging.info("Verifying vmcore generated after unplug kdump")
+                    post_vmcores = utils_kdump.get_vmcores(
+                        vm, crash_dir=crash_dir, test=test)
+                    if not post_vmcores:
+                        test.fail("No vmcore generated after unplug kdump")
+                    logging.info("vmcore confirmed after unplug: %s",
+                                 post_vmcores)
+
                 check_setvcpus_result(result, status_error)
                 if setvcpu_option == "--config":
                     expect_vcpu_num['cur_config'] = vcpu_unplug_num
@@ -542,8 +575,11 @@ def run(test, params, env):
                         if not cpu.check_vcpu_value(vm, expect_vcpu_num, expect_vcpupin, setvcpu_option):
                             logging.error("Expected vcpu check failed")
                             result_failed += 1
-        if vm.uptime() < vm_uptime_init:
-            test.fail("Unexpected VM reboot detected in between test")
+        # Skip uptime check when kdump is enabled: kdump intentionally
+        # crashes and reboots the guest, so a lower uptime is expected.
+        if not kdump_after_plug_unplug:
+            if vm.uptime() < vm_uptime_init:
+                test.fail("Unexpected VM reboot detected in between test")
     # Recover env
     finally:
         if need_mkswap:
