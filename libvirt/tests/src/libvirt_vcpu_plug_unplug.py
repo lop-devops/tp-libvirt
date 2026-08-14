@@ -12,6 +12,7 @@ from virttest import cpu
 from virttest import utils_libvirtd
 from virttest import utils_test
 from virttest.utils_test import libvirt
+from virttest import utils_kdump
 from virttest.libvirt_xml.vm_xml import VMXML
 
 from provider.cpu import patch_total_cpu_count_s390x
@@ -146,6 +147,30 @@ def run(test, params, env):
         session.close()
         return False not in cpu_is_online
 
+    def offline_guest_cpus(vm, cpu_list_str):
+        """
+        Offline specified CPUs inside the guest by writing 0 to
+        /sys/devices/system/cpu/cpuN/online for each cpu in cpu_list_str.
+
+        :param vm: VM object
+        :param cpu_list_str: comma-separated CPU ids to offline, e.g. "1,2"
+        """
+        if not cpu_list_str:
+            return
+        session = vm.wait_for_login(timeout=240)
+        try:
+            for cpu_id in cpu_list_str.split(","):
+                cpu_id = cpu_id.strip()
+                cpu_path = "/sys/devices/system/cpu/cpu%s/online" % cpu_id
+                ret, out = session.cmd_status_output(
+                    "echo 0 > %s" % cpu_path)
+                if ret:
+                    test.fail("Failed to offline cpu%s in guest: %s"
+                               % (cpu_id, out))
+                logging.info("Offlined cpu%s in guest", cpu_id)
+        finally:
+            session.close()
+
     def check_setvcpus_result(cmd_result, expect_error):
         """
         Check command result.
@@ -240,6 +265,10 @@ def run(test, params, env):
     with_stress = "yes" == params.get("run_stress", "no")
     iterations = int(params.get("test_itr", 1))
     topology_correction = "yes" == params.get("topology_correction", "no")
+    kdump_after_plug_unplug = "yes" == params.get("kdump_after_plug_unplug", "no")
+    crash_dir = params.get("crash_dir", "/var/crash/")
+    offline_cpu_before_setvcpus = "yes" == params.get("offline_cpu_before_setvcpus", "no")
+    offline_cpu_list = params.get("offline_cpu_list", "")
     # Init expect vcpu count values
     expect_vcpu_num = {'max_config': vcpu_max_num, 'max_live': vcpu_max_num,
                        'cur_config': vcpu_current_num,
@@ -338,6 +367,12 @@ def run(test, params, env):
                     libvirt.check_exit_status(result)
                     expect_vcpupin = {pin_vcpu: pin_cpu_list}
 
+                # Offline guest CPUs before hotplug if requested
+                if offline_cpu_before_setvcpus and offline_cpu_list:
+                    logging.info("Offlining guest CPUs %s before hotplug",
+                                 offline_cpu_list)
+                    offline_guest_cpus(vm, offline_cpu_list)
+
                 result = virsh.setvcpus(vm_name, vcpu_plug_num, setvcpu_option,
                                         readonly=setvcpu_readonly,
                                         ignore_status=True, debug=True)
@@ -352,9 +387,31 @@ def run(test, params, env):
                     expect_vcpu_num['cur_live'] = vcpu_plug_num
                     expect_vcpu_num['guest_live'] = vcpu_plug_num
                     if not status_error:
-                        if not utils_misc.wait_for(lambda: cpu.check_if_vm_vcpu_match(vcpu_plug_num, vm),
-                                                   vcpu_max_timeout, text="wait for vcpu online") or not online_new_vcpu(vm, vcpu_plug_num):
+                        # When some guest CPUs are offlined before hotplug,
+                        # the expected online count is reduced accordingly.
+                        offline_count = (len(offline_cpu_list.split(","))
+                                         if offline_cpu_before_setvcpus and offline_cpu_list
+                                         else 0)
+                        expected_online = vcpu_plug_num - offline_count
+                        if not utils_misc.wait_for(
+                                lambda: cpu.check_if_vm_vcpu_match(expected_online, vm),
+                                vcpu_max_timeout, text="wait for vcpu online") or not online_new_vcpu(vm, vcpu_plug_num):
                             test.fail("Fail to enable new added cpu")
+
+                        # Trigger kdump after hotplug to verify guest kernel
+                        # stability under the new vCPU count
+                        if kdump_after_plug_unplug:
+                            logging.info("Triggering kdump after vCPU hotplug")
+                            kdump_session = vm.wait_for_login(timeout=240)
+                            utils_kdump.trigger_crash(vm, session=kdump_session,
+                                                      wait_time=120, test=test)
+                            logging.info("Verifying vmcore generated after hotplug kdump")
+                            pre_vmcores = utils_kdump.get_vmcores(
+                                vm, crash_dir=crash_dir, test=test)
+                            if not pre_vmcores:
+                                test.fail("No vmcore generated after hotplug kdump")
+                            logging.info("vmcore confirmed after hotplug: %s",
+                                         pre_vmcores)
 
                 # Pin vcpu
                 if pin_after_plug:
@@ -447,6 +504,12 @@ def run(test, params, env):
                 # So for case of unpluging vcpus from max vcpu number to 1, when
                 # setvcpus return, need continue to obverse if vcpu number is
                 # continually to be unplugged to 1 gradually.
+                # Offline guest CPUs before unplug if requested
+                if offline_cpu_before_setvcpus and offline_cpu_list:
+                    logging.info("Offlining guest CPUs %s before unplug",
+                                 offline_cpu_list)
+                    offline_guest_cpus(vm, offline_cpu_list)
+
                 result = virsh.setvcpus(vm_name, vcpu_unplug_num,
                                         setvcpu_option,
                                         readonly=setvcpu_readonly,
@@ -478,6 +541,21 @@ def run(test, params, env):
                 finally:
                     if session:
                         session.close()
+
+                # Trigger kdump after unplug to verify guest kernel
+                # stability under the reduced vCPU count
+                if kdump_after_plug_unplug:
+                    logging.info("Triggering kdump after vCPU unplug")
+                    kdump_session = vm.wait_for_login(timeout=240)
+                    utils_kdump.trigger_crash(vm, session=kdump_session,
+                                              wait_time=120, test=test)
+                    logging.info("Verifying vmcore generated after unplug kdump")
+                    post_vmcores = utils_kdump.get_vmcores(
+                        vm, crash_dir=crash_dir, test=test)
+                    if not post_vmcores:
+                        test.fail("No vmcore generated after unplug kdump")
+                    logging.info("vmcore confirmed after unplug: %s",
+                                 post_vmcores)
 
                 check_setvcpus_result(result, status_error)
                 if setvcpu_option == "--config":
@@ -542,8 +620,11 @@ def run(test, params, env):
                         if not cpu.check_vcpu_value(vm, expect_vcpu_num, expect_vcpupin, setvcpu_option):
                             logging.error("Expected vcpu check failed")
                             result_failed += 1
-        if vm.uptime() < vm_uptime_init:
-            test.fail("Unexpected VM reboot detected in between test")
+        # Skip uptime check when kdump is enabled: kdump intentionally
+        # crashes and reboots the guest, so a lower uptime is expected.
+        if not kdump_after_plug_unplug:
+            if vm.uptime() < vm_uptime_init:
+                test.fail("Unexpected VM reboot detected in between test")
     # Recover env
     finally:
         if need_mkswap:
